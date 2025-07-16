@@ -1,5 +1,4 @@
-/*
- * MIT License
+/* MIT License
  *
  * Copyright (c) 2017 David Antliff
  *
@@ -24,378 +23,269 @@
 
 /**
  * @file smbus.c
+ * @brief SMBus helper layer implemented on top of the ESP-IDF v5.x *new* I²C master driver.
  *
- * SMBus diagrams are represented as a chain of "piped" symbols, using the following symbols:
+ * The implementation keeps the original high-level API intact while replacing all
+ * low-level legacy calls with the following new primitives declared in
+ * `driver/i2c_master.h`:
+ *   • `i2c_master_transmit()` – write transaction
+ *   • `i2c_master_receive()`  – pure read transaction
+ *   • `i2c_master_transmit_receive()` – combined write/read with repeated-START
  *
- *   - ADDR  : the 7-bit I2C address of a bus slave.
- *   - S     : the START condition sent by a bus master.
- *   - Sr    : the REPEATED START condition sent by a master.
- *   - P     : the STOP condition sent by a master.
- *   - Wr    : bit 0 of the address byte indicating a write operation. Value is 0.
- *   - Rd    : bit 0 of the address byte indicating a read operation. Value is 1.
- *   - R/W   : bit 0 of the address byte, indicating a read or write operation.
- *   - A     : ACKnowledge bit sent by a master.
- *   - N     : Not ACKnowledge bit set by a master.
- *   - As    : ACKnowledge bit sent by a slave.
- *   - Ns    : Not ACKnowledge bit set by a slave.
- *   - DATA  : data byte sent by a master.
- *   - DATAs : data byte sent by a slave.
+ * The driver uses an opaque `i2c_master_dev_handle_t` instead of raw port numbers
+ * and 7-bit addresses.  A handle is obtained once via `i2c_master_bus_add_device()`
+ * during initialisation in `main.c` and passed to this module via
+ * `smbus_init_device_handle()`.
  */
 
-// TODO: add proper error checking around all i2c functions
-
-#include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_system.h"
 #include "esp_log.h"
+#include "driver/i2c_master.h"
 
 #include "smbus.h"
 
-static const char * TAG = "smbus";
+#define MAX_BLOCK_LEN         255      /**< SMBus 3.0 maximum block length. */
+#define SMBUS_DEFAULT_TIMEOUT 1000     /**< Default timeout in milliseconds. */
 
-#define WRITE_BIT      I2C_MASTER_WRITE
-#define READ_BIT       I2C_MASTER_READ
-#define ACK_CHECK      true
-#define NO_ACK_CHECK   false
-#define ACK_VALUE      0x0
-#define NACK_VALUE     0x1
-#define MAX_BLOCK_LEN  255  // SMBus v3.0 increases this from 32 to 255
-//#define MEASURE             // enable measurement and reporting of I2C transaction duration
+static const char *TAG = "smbus";
 
-static bool _is_init(const smbus_info_t * smbus_info)
+/**
+ * @brief Internal SMBus context.
+ */
+struct smbus_info_t
 {
-    bool ok = false;
-    if (smbus_info != NULL)
-    {
-        if (smbus_info->init)
-        {
-            ok = true;
-        }
-        else
-        {
-            ESP_LOGE(TAG, "smbus_info is not initialised");
-        }
+    i2c_master_dev_handle_t dev;  /**< Device handle obtained from new I²C driver. */
+    uint32_t                timeout_ms; /**< Per-transaction timeout. */
+    bool                    init;       /**< Indicates successful initialisation. */
+};
+
+/* ------------------------------------------------------------------------- */
+/*                      ───  PRIVATE HELPERS  ───                            */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * @brief Test whether the context pointer is valid and initialised.
+ */
+static bool _is_init(const smbus_info_t *info)
+{
+    if (info && info->init) {
+        return true;
     }
-    else
-    {
-        ESP_LOGE(TAG, "smbus_info is NULL");
-    }
-    return ok;
+    ESP_LOGE(TAG, "smbus_info not initialised");
+    return false;
 }
 
-static esp_err_t _check_i2c_error(esp_err_t err)
+/**
+ * @brief Translate ESP-IDF error codes to readable log messages.
+ */
+static esp_err_t _check_err(esp_err_t err)
 {
-    switch (err)
-    {
-    case ESP_OK:  // Success
-        break;
-    case ESP_ERR_INVALID_ARG:  // Parameter error
-        ESP_LOGE(TAG, "I2C parameter error");
-        break;
-    case ESP_FAIL: // Sending command error, slave doesn't ACK the transfer.
-        ESP_LOGE(TAG, "I2C no slave ACK");
-        break;
-    case ESP_ERR_INVALID_STATE:  // I2C driver not installed or not in master mode.
-        ESP_LOGE(TAG, "I2C driver not installed or not master");
-        break;
-    case ESP_ERR_TIMEOUT:  // Operation timeout because the bus is busy.
-        ESP_LOGE(TAG, "I2C timeout");
-        break;
-    default:
-        ESP_LOGE(TAG, "I2C error %d", err);
+    if (err == ESP_OK) {
+        return ESP_OK;
     }
+    ESP_LOGE(TAG, "I²C error: %d", err);
     return err;
 }
 
-esp_err_t _write_bytes(const smbus_info_t * smbus_info, uint8_t command, uint8_t * data, size_t len)
+/**
+ * @brief Write arbitrary bytes to a device register.
+ *
+ * @param[in] info    SMBus context.
+ * @param[in] command Register/command code.
+ * @param[in] data    Data buffer to transmit (may be NULL when len==0).
+ * @param[in] len     Number of data bytes.
+ *
+ * @return ESP_OK on success.
+ */
+static esp_err_t _write_bytes(const smbus_info_t *info, uint8_t command,
+                              const uint8_t *data, size_t len)
 {
-    // Protocol: [S | ADDR | Wr | As | COMMAND | As | (DATA | As){*len} | P]
-    esp_err_t err = ESP_FAIL;
-    if (_is_init(smbus_info) && data)
-    {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, smbus_info->address << 1 | WRITE_BIT, ACK_CHECK);
-        i2c_master_write_byte(cmd, command, ACK_CHECK);
-        i2c_master_write(cmd, data, len, ACK_CHECK);
-        i2c_master_stop(cmd);
-#ifdef MEASURE
-        uint64_t start_time = esp_timer_get_time();
-#endif
-        err = _check_i2c_error(i2c_master_cmd_begin(smbus_info->i2c_port, cmd, smbus_info->timeout));
-#ifdef MEASURE
-        ESP_LOGI(TAG, "_write_bytes: i2c_master_cmd_begin took %"PRIu64" us", esp_timer_get_time() - start_time);
-#endif
-        i2c_cmd_link_delete(cmd);
-    }
-    return err;
-}
-
-esp_err_t _read_bytes(const smbus_info_t * smbus_info, uint8_t command, uint8_t * data, size_t len)
-{
-    // Protocol: [S | ADDR | Wr | As | COMMAND | As | Sr | ADDR | Rd | As | (DATAs | A){*len-1} | DATAs | N | P]
-    esp_err_t err = ESP_FAIL;
-    if (_is_init(smbus_info) && data)
-    {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, smbus_info->address << 1 | WRITE_BIT, ACK_CHECK);
-        i2c_master_write_byte(cmd, command, ACK_CHECK);
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, smbus_info->address << 1 | READ_BIT, ACK_CHECK);
-        if (len > 1)
-        {
-            i2c_master_read(cmd, data, len - 1, ACK_VALUE);
-        }
-        i2c_master_read_byte(cmd, &data[len - 1], NACK_VALUE);
-        i2c_master_stop(cmd);
-#ifdef MEASURE
-        uint64_t start_time = esp_timer_get_time();
-#endif
-        err = _check_i2c_error(i2c_master_cmd_begin(smbus_info->i2c_port, cmd, smbus_info->timeout));
-#ifdef MEASURE
-        ESP_LOGI(TAG, "_read_bytes: i2c_master_cmd_begin took %"PRIu64" us", esp_timer_get_time() - start_time);
-#endif
-        i2c_cmd_link_delete(cmd);
-    }
-    return err;
-}
-
-
-// Public API
-
-smbus_info_t * smbus_malloc(void)
-{
-    smbus_info_t * smbus_info = malloc(sizeof(*smbus_info));
-    if (smbus_info != NULL)
-    {
-        memset(smbus_info, 0, sizeof(*smbus_info));
-        ESP_LOGD(TAG, "malloc smbus_info_t %p", smbus_info);
-    }
-    else
-    {
-        ESP_LOGE(TAG, "malloc smbus_info_t failed");
-    }
-    return smbus_info;
-}
-
-void smbus_free(smbus_info_t ** smbus_info)
-{
-    if (smbus_info != NULL && (*smbus_info != NULL))
-    {
-        ESP_LOGD(TAG, "free smbus_info_t %p", *smbus_info);
-        free(*smbus_info);
-        *smbus_info = NULL;
-    }
-    else
-    {
-        ESP_LOGE(TAG, "free smbus_info_t failed");
-    }
-}
-
-esp_err_t smbus_init(smbus_info_t * smbus_info, i2c_port_t i2c_port, i2c_address_t address)
-{
-    if (smbus_info != NULL)
-    {
-        smbus_info->i2c_port = i2c_port;
-        smbus_info->address = address;
-        smbus_info->timeout = SMBUS_DEFAULT_TIMEOUT;
-        smbus_info->init = true;
-    }
-    else
-    {
-        ESP_LOGE(TAG, "smbus_info is NULL");
+    if (!_is_init(info)) {
         return ESP_FAIL;
     }
+
+    uint8_t txbuf[MAX_BLOCK_LEN + 1];
+    if (len > MAX_BLOCK_LEN) {
+        ESP_LOGE(TAG, "write length %d > %d", (int)len, MAX_BLOCK_LEN);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    txbuf[0] = command;
+    if (data && len) {
+        memcpy(&txbuf[1], data, len);
+    }
+
+    return _check_err(i2c_master_transmit(info->dev, txbuf, len + 1, info->timeout_ms));
+}
+
+/**
+ * @brief Read arbitrary bytes from a device register (write-then-read with repeated-START).
+ *
+ * @param[in]  info    SMBus context.
+ * @param[in]  command Register/command code.
+ * @param[out] data    Destination buffer.
+ * @param[in]  len     Number of bytes to read.
+ */
+static esp_err_t _read_bytes(const smbus_info_t *info, uint8_t command,
+                             uint8_t *data, size_t len)
+{
+    if (!_is_init(info)) {
+        return ESP_FAIL;
+    }
+    if (!data || !len) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return _check_err(i2c_master_transmit_receive(info->dev, &command, 1,
+                                                  data, len, info->timeout_ms));
+}
+
+/* ------------------------------------------------------------------------- */
+/*                      ───  PUBLIC API  ───                                 */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * @brief Allocate an SMBus context.
+ */
+smbus_info_t *smbus_malloc(void)
+{
+    smbus_info_t *info = calloc(1, sizeof(*info));
+    if (!info) {
+        ESP_LOGE(TAG, "malloc failed");
+    }
+    return info;
+}
+
+/**
+ * @brief Free an SMBus context.
+ */
+void smbus_free(smbus_info_t **info)
+{
+    if (info && *info) {
+        free(*info);
+        *info = NULL;
+    }
+}
+
+/**
+ * @brief Initialise the context with an I²C device handle.
+ */
+esp_err_t smbus_init_device_handle(smbus_info_t *info, i2c_master_dev_handle_t dev)
+{
+    if (!info) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    info->dev        = dev;
+    info->timeout_ms = SMBUS_DEFAULT_TIMEOUT;
+    info->init       = true;
     return ESP_OK;
 }
 
-esp_err_t smbus_set_timeout(smbus_info_t * smbus_info, portBASE_TYPE timeout)
+/**
+ * @brief Set per-transaction timeout.
+ */
+esp_err_t smbus_set_timeout(smbus_info_t *info, uint32_t timeout_ms)
 {
-    esp_err_t err = ESP_FAIL;
-    if (_is_init(smbus_info))
-    {
-        smbus_info->timeout = timeout;
-        err = ESP_OK;
+    if (!_is_init(info)) {
+        return ESP_FAIL;
+    }
+    info->timeout_ms = timeout_ms;
+    return ESP_OK;
+}
+
+/* --------  Simple SMBus transactions  ----------------------------------- */
+
+esp_err_t smbus_send_byte(const smbus_info_t *info, uint8_t data)
+{
+    /* SMBus definition: command byte == data for Send-Byte. */
+    return _write_bytes(info, data, NULL, 0);
+}
+
+esp_err_t smbus_receive_byte(const smbus_info_t *info, uint8_t *data)
+{
+    /* SMBus Receive-Byte: no command phase, only address + read. */
+    if (!_is_init(info) || !data) {
+        return ESP_FAIL;
+    }
+    return _check_err(i2c_master_receive(info->dev, data, 1, info->timeout_ms));
+}
+
+esp_err_t smbus_write_byte(const smbus_info_t *info, uint8_t command, uint8_t data)
+{
+    return _write_bytes(info, command, &data, 1);
+}
+
+esp_err_t smbus_write_word(const smbus_info_t *info, uint8_t command, uint16_t data)
+{
+    uint8_t buf[2] = { (uint8_t)(data & 0xFF), (uint8_t)(data >> 8) };
+    return _write_bytes(info, command, buf, 2);
+}
+
+esp_err_t smbus_read_byte(const smbus_info_t *info, uint8_t command, uint8_t *data)
+{
+    return _read_bytes(info, command, data, 1);
+}
+
+esp_err_t smbus_read_word(const smbus_info_t *info, uint8_t command, uint16_t *data)
+{
+    uint8_t buf[2];
+    esp_err_t err = _read_bytes(info, command, buf, 2);
+    if (err == ESP_OK && data) {
+        *data = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
     }
     return err;
 }
 
-esp_err_t smbus_quick(const smbus_info_t * smbus_info, bool bit)
+esp_err_t smbus_write_block(const smbus_info_t *info, uint8_t command,
+                            uint8_t *data, uint8_t len)
 {
-    // Protocol: [S | ADDR | R/W | As | P]
-    esp_err_t err = ESP_FAIL;
-    if (_is_init(smbus_info))
-    {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, smbus_info->address << 1 | bit, ACK_CHECK);
-        i2c_master_stop(cmd);
-        err = _check_i2c_error(i2c_master_cmd_begin(smbus_info->i2c_port, cmd, smbus_info->timeout));
-        i2c_cmd_link_delete(cmd);
+    if (len > MAX_BLOCK_LEN) {
+        return ESP_ERR_INVALID_ARG;
     }
-    return err;
+    /* SMBus block write prefixes length. */
+    uint8_t buf[MAX_BLOCK_LEN + 2];
+    buf[0] = command;
+    buf[1] = len;
+    memcpy(&buf[2], data, len);
+    return _check_err(i2c_master_transmit(info->dev, buf, len + 2, info->timeout_ms));
 }
 
-esp_err_t smbus_send_byte(const smbus_info_t * smbus_info, uint8_t data)
+esp_err_t smbus_read_block(const smbus_info_t *info, uint8_t command,
+                           uint8_t *data, uint8_t *len)
 {
-    // Protocol: [S | ADDR | Wr | As | DATA | As | P]
-    esp_err_t err = ESP_FAIL;
-    if (_is_init(smbus_info))
-    {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, smbus_info->address << 1 | WRITE_BIT, ACK_CHECK);
-        i2c_master_write_byte(cmd, data, ACK_CHECK);
-        i2c_master_stop(cmd);
-        err = _check_i2c_error(i2c_master_cmd_begin(smbus_info->i2c_port, cmd, smbus_info->timeout));
-        i2c_cmd_link_delete(cmd);
+    if (!data || !len) {
+        return ESP_ERR_INVALID_ARG;
     }
-    return err;
-}
 
-esp_err_t smbus_receive_byte(const smbus_info_t * smbus_info, uint8_t * data)
-{
-    // Protocol: [S | ADDR | Rd | As | DATAs | N | P]
-    esp_err_t err = ESP_FAIL;
-    if (_is_init(smbus_info))
-    {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, smbus_info->address << 1 | READ_BIT, ACK_CHECK);
-        i2c_master_read_byte(cmd, data, NACK_VALUE);
-        i2c_master_stop(cmd);
-        err = _check_i2c_error(i2c_master_cmd_begin(smbus_info->i2c_port, cmd, smbus_info->timeout));
-        i2c_cmd_link_delete(cmd);
+    /* Read first byte to learn length */
+    uint8_t length = 0;
+    esp_err_t err = i2c_master_transmit_receive(info->dev, &command, 1,
+                                                &length, 1, info->timeout_ms);
+    if (err != ESP_OK) {
+        *len = 0;
+        return _check_err(err);
     }
-    return err;
+
+    uint8_t to_read = (length > *len) ? *len : length;
+    err = i2c_master_receive(info->dev, data, to_read, info->timeout_ms);
+    *len = (err == ESP_OK) ? to_read : 0;
+    return _check_err(err);
 }
 
-esp_err_t smbus_write_byte(const smbus_info_t * smbus_info, uint8_t command, uint8_t data)
+/* Convenience wrappers that keep the old function names ------------------ */
+
+esp_err_t smbus_i2c_write_block(const smbus_info_t *info, uint8_t command,
+                                uint8_t *data, size_t len)
 {
-    // Protocol: [S | ADDR | Wr | As | COMMAND | As | DATA | As | P]
-    return _write_bytes(smbus_info, command, &data, 1);
+    return _write_bytes(info, command, data, len);
 }
 
-esp_err_t smbus_write_word(const smbus_info_t * smbus_info, uint8_t command, uint16_t data)
+esp_err_t smbus_i2c_read_block(const smbus_info_t *info, uint8_t command,
+                               uint8_t *data, size_t len)
 {
-    // Protocol: [S | ADDR | Wr | As | COMMAND | As | DATA-LOW | As | DATA-HIGH | As | P]
-    uint8_t temp[2] = { data & 0xff, (data >> 8) & 0xff };
-    return _write_bytes(smbus_info, command, temp, 2);
-}
-
-esp_err_t smbus_read_byte(const smbus_info_t * smbus_info, uint8_t command, uint8_t * data)
-{
-    // Protocol: [S | ADDR | Wr | As | COMMAND | As | Sr | ADDR | Rd | As | DATA | N | P]
-    return _read_bytes(smbus_info, command, data, 1);
-}
-
-esp_err_t smbus_read_word(const smbus_info_t * smbus_info, uint8_t command, uint16_t * data)
-{
-    // Protocol: [S | ADDR | Wr | As | COMMAND | As | Sr | ADDR | Rd | As | DATA-LOW | A | DATA-HIGH | N | P]
-    esp_err_t err = ESP_FAIL;
-    uint8_t temp[2] = { 0 };
-    if (data)
-    {
-        err = _read_bytes(smbus_info, command, temp, 2);
-        if (err == ESP_OK)
-        {
-            *data = (temp[1] << 8) + temp[0];
-        }
-        else
-        {
-            *data = 0;
-        }
-    }
-    return err;
-}
-
-esp_err_t smbus_write_block(const smbus_info_t * smbus_info, uint8_t command, uint8_t * data, uint8_t len)
-{
-    // Protocol: [S | ADDR | Wr | As | COMMAND | As | LEN | As | DATA-1 | As | DATA-2 | As ... | DATA-LEN | As | P]
-    esp_err_t err = ESP_FAIL;
-    if (_is_init(smbus_info) && data)
-    {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, smbus_info->address << 1 | WRITE_BIT, ACK_CHECK);
-        i2c_master_write_byte(cmd, command, ACK_CHECK);
-        i2c_master_write_byte(cmd, len, ACK_CHECK);
-        for (size_t i = 0; i < len; ++i)
-        {
-            i2c_master_write_byte(cmd, data[i], ACK_CHECK);
-        }
-        i2c_master_stop(cmd);
-        err = _check_i2c_error(i2c_master_cmd_begin(smbus_info->i2c_port, cmd, smbus_info->timeout));
-        i2c_cmd_link_delete(cmd);
-    }
-    return err;
-}
-
-esp_err_t smbus_read_block(const smbus_info_t * smbus_info, uint8_t command, uint8_t * data, uint8_t * len)
-{
-    // Protocol: [S | ADDR | Wr | As | COMMAND | As | Sr | ADDR | Rd | As | LENs | A | DATA-1 | A | DATA-2 | A ... | DATA-LEN | N | P]
-    esp_err_t err = ESP_FAIL;
-    
-    if (_is_init(smbus_info) && data && len)
-    {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, smbus_info->address << 1 | WRITE_BIT, ACK_CHECK);
-        i2c_master_write_byte(cmd, command, ACK_CHECK);
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, smbus_info->address << 1 | READ_BIT, ACK_CHECK);
-        uint8_t slave_len = 0;
-        i2c_master_read_byte(cmd, &slave_len, ACK_VALUE);
-        err = _check_i2c_error(i2c_master_cmd_begin(smbus_info->i2c_port, cmd, smbus_info->timeout));
-        i2c_cmd_link_delete(cmd);
-
-        if (err != ESP_OK)
-        {
-            *len = 0;
-            return err;
-        }
-
-        if (slave_len > *len)
-        {
-            ESP_LOGW(TAG, "slave data length %d exceeds data len %d bytes", slave_len, *len);
-            slave_len = *len;
-        }
-
-        cmd = i2c_cmd_link_create();
-        for (size_t i = 0; i < slave_len - 1; ++i)
-        {
-            i2c_master_read_byte(cmd, &data[i], ACK_VALUE);
-        }
-        i2c_master_read_byte(cmd, &data[slave_len - 1], NACK_VALUE);
-        i2c_master_stop(cmd);
-        err = _check_i2c_error(i2c_master_cmd_begin(smbus_info->i2c_port, cmd, smbus_info->timeout));
-        i2c_cmd_link_delete(cmd);
-
-        if (err == ESP_OK)
-        {
-            *len = slave_len;
-        }
-        else
-        {
-            *len = 0;
-        }
-    }
-    return err;
-}
-
-esp_err_t smbus_i2c_write_block(const smbus_info_t * smbus_info, uint8_t command, uint8_t * data, size_t len)
-{
-    // Protocol: [S | ADDR | Wr | As | COMMAND | As | (DATA | As){*len} | P]
-    return _write_bytes(smbus_info, command, data, len);
-}
-
-esp_err_t smbus_i2c_read_block(const smbus_info_t * smbus_info, uint8_t command, uint8_t * data, size_t len)
-{
-    // Protocol: [S | ADDR | Wr | As | COMMAND | As | Sr | ADDR | Rd | As | (DATAs | A){*len-1} | DATAs | N | P]
-    return _read_bytes(smbus_info, command, data, len);
+    return _read_bytes(info, command, data, len);
 }

@@ -53,23 +53,10 @@ typedef uint16_t i2c_address_t;
 typedef struct
 {
     bool init;                     ///< True if struct has been initialised, otherwise false
-    i2c_port_t i2c_port;           ///< ESP-IDF I2C port number
-    i2c_address_t address;         ///< I2C address of slave device
-    portBASE_TYPE timeout;         ///< Number of ticks until I2C operation timeout
+    i2c_master_dev_handle_t dev;   ///< I2C device handle obtained from new I2C driver.
+    uint32_t timeout_ms;      ///< Number of ticks until I2C operation timeout
 } smbus_info_t;
 
-/**
- * @brief Construct a new SMBus info instance.
- *        New instance should be initialised before calling other functions.
- * @return Pointer to new device info instance, or NULL if it cannot be created.
- */
-smbus_info_t * smbus_malloc(void);
-
-/**
- * @brief Delete an existing SMBus info instance.
- * @param[in,out] smbus_info Pointer to SMBus info instance that will be freed and set to NULL.
- */
-void smbus_free(smbus_info_t ** smbus_info);
 
 /**
  * @brief Initialise a SMBus info instance with the specified I2C information.
@@ -78,7 +65,7 @@ void smbus_free(smbus_info_t ** smbus_info);
  * @param[in] i2c_port I2C port to associate with this SMBus instance.
  * @param[in] address Address of I2C slave device.
  */
-esp_err_t smbus_init(smbus_info_t * smbus_info, i2c_port_t i2c_port, i2c_address_t address);
+esp_err_t smbus_init_device_handle(smbus_info_t *info, i2c_master_dev_handle_t dev);
 
 /**
  * @brief Set the I2C timeout.
@@ -87,7 +74,7 @@ esp_err_t smbus_init(smbus_info_t * smbus_info, i2c_port_t i2c_port, i2c_address
  * @param[in] timeout Number of ticks to wait until the transaction is considered in error.
  * @return ESP_OK if successful, ESP_FAIL or ESP_ERR_* if an error occurred.
  */
-esp_err_t smbus_set_timeout(smbus_info_t * smbus_info, portBASE_TYPE timeout);
+esp_err_t smbus_set_timeout(smbus_info_t *info, uint32_t timeout_ms);
 
 /**
  * @brief Send a single bit to a slave device in the place of the read/write bit.
